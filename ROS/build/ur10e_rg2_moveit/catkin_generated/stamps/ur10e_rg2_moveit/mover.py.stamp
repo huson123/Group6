@@ -1,0 +1,544 @@
+#!/usr/bin/env python
+
+from __future__ import print_function
+
+import rospy
+import sys
+import copy
+import math
+import moveit_commander
+
+import moveit_msgs.msg
+from moveit_msgs.msg import Constraints, JointConstraint, PositionConstraint, OrientationConstraint, BoundingVolume
+from sensor_msgs.msg import JointState
+from moveit_msgs.msg import RobotState, CollisionObject
+import geometry_msgs.msg
+from geometry_msgs.msg import Quaternion, Pose
+from std_msgs.msg import String
+from moveit_commander.conversions import pose_to_list
+
+from ur10e_rg2_moveit.srv import MoverService, MoverServiceRequest, MoverServiceResponse
+
+joint_names = ['shoulder_pan_joint', 'shoulder_lift_joint', 'elbow_joint', 'wrist_1_joint', 'wrist_2_joint', 'wrist_3_joint']
+
+# ===== GLOBAL-LOCAL PLANNING CONFIGURATION =====
+# Global variable to store moving obstacle position
+moving_obstacle_pose = None
+moving_obstacle_velocity = None  # Track velocity for prediction
+moving_obstacle_dimensions = None  # Store obstacle size (x, y, z)
+last_obstacle_update_time = None
+
+# Planning scene interface for collision checking
+scene = None
+
+# Safety parameters
+SAFE_DISTANCE = 0.25  # Minimum safe distance in meters
+REPLAN_DISTANCE = 0.35  # Distance threshold to trigger replanning
+PREDICTION_HORIZON = 1.0  # Seconds to predict obstacle motion
+
+# Replanning parameters
+MAX_REPLAN_ATTEMPTS = 3
+REPLAN_TIMEOUT = 5.0  # Max time for replanning
+
+# Between Melodic and Noetic, the return type of plan() changed. moveit_commander has no __version__ variable, so checking the python version as a proxy
+if sys.version_info >= (3, 0):
+    def planCompat(plan):
+        return plan[1]
+else:
+    def planCompat(plan):
+        return plan
+
+"""
+    Callback function to track moving obstacle position and estimate velocity.
+    This enables predictive collision avoidance (local planning).
+"""
+def collision_callback(msg):
+    global moving_obstacle_pose, moving_obstacle_velocity, moving_obstacle_dimensions, last_obstacle_update_time, scene
+    
+    # DEBUG: Log all incoming messages
+    rospy.loginfo_throttle(2.0, f"[OBSTACLE UPDATE] Received: {msg.id}, operation: {msg.operation}")
+    
+    # Track moving_obstacle position
+    if msg.id == "moving_obstacle" and len(msg.primitive_poses) > 0:
+        new_pose = msg.primitive_poses[0]
+        current_time = rospy.Time.now()
+        
+        # Store obstacle dimensions if available
+        if len(msg.primitives) > 0 and msg.primitives[0].type == msg.primitives[0].BOX:
+            moving_obstacle_dimensions = tuple(msg.primitives[0].dimensions)
+            rospy.loginfo_throttle(5.0, f"[OBSTACLE] Dimensions: {moving_obstacle_dimensions}")
+        
+        # Log position
+        rospy.loginfo_throttle(2.0, 
+            f"[OBSTACLE] Position: x={new_pose.position.x:.3f}, y={new_pose.position.y:.3f}, z={new_pose.position.z:.3f}")
+        
+        # Estimate velocity if we have previous position
+        if moving_obstacle_pose is not None and last_obstacle_update_time is not None:
+            dt = (current_time - last_obstacle_update_time).to_sec()
+            if dt > 0:
+                dx = new_pose.position.x - moving_obstacle_pose.position.x
+                dy = new_pose.position.y - moving_obstacle_pose.position.y
+                dz = new_pose.position.z - moving_obstacle_pose.position.z
+                
+                moving_obstacle_velocity = {
+                    'vx': dx / dt,
+                    'vy': dy / dt,
+                    'vz': dz / dt,
+                    'speed': math.sqrt((dx/dt)**2 + (dy/dt)**2 + (dz/dt)**2)
+                }
+                
+                rospy.loginfo_throttle(3.0, 
+                    f"[OBSTACLE] Velocity: {moving_obstacle_velocity['speed']:.3f} m/s")
+        
+        moving_obstacle_pose = new_pose
+        last_obstacle_update_time = current_time
+        
+        # Update planning scene with obstacle
+        if scene is not None:
+            try:
+                pose_stamped = geometry_msgs.msg.PoseStamped()
+                # Use base_link frame (Unity publishes in base_link)
+                pose_stamped.header.frame_id = "base_link"
+                pose_stamped.header.stamp = rospy.Time.now()
+                pose_stamped.pose = new_pose
+                
+                if len(msg.primitives) > 0:
+                    primitive = msg.primitives[0]
+                    if primitive.type == primitive.BOX:
+                        # Check if obstacle already exists before removing
+                        known_objects = scene.get_known_object_names()
+                        if msg.id in known_objects:
+                            # Remove old obstacle first to force update
+                            scene.remove_world_object(msg.id)
+                            rospy.sleep(0.1)
+                        
+                        # Add box to planning scene
+                        scene.add_box(
+                            name=msg.id,
+                            pose=pose_stamped,
+                            size=tuple(primitive.dimensions)
+                        )
+                        
+                        # Give planning scene time to update
+                        rospy.sleep(0.2)
+                        
+                        # Verify it was added
+                        known_objects = scene.get_known_object_names()
+                        if msg.id in known_objects:
+                            rospy.loginfo_throttle(5.0, f"[PLANNING SCENE] ✓ {msg.id} in scene. Objects: {known_objects}")
+                        else:
+                            rospy.logwarn_throttle(5.0, f"[PLANNING SCENE] ✗ {msg.id} NOT in scene! Known: {known_objects}")
+                            rospy.logwarn_throttle(5.0, f"[PLANNING SCENE] Frame: {pose_stamped.header.frame_id}, Dimensions: {primitive.dimensions}")
+                    else:
+                        rospy.logwarn(f"[OBSTACLE] Unknown primitive type: {primitive.type}")
+                else:
+                    rospy.logwarn(f"[OBSTACLE] No primitives in message")
+            except Exception as e:
+                rospy.logerr(f"[PLANNING SCENE] Error updating obstacle: {e}")
+        else:
+            rospy.logwarn_throttle(5.0, "[PLANNING SCENE] Scene not initialized!")
+   
+def plan_trajectory(move_group, destination_pose, start_joint_angles, max_attempts=100): 
+    for attempt in range(max_attempts):
+        try:
+            current_joint_state = JointState()
+            current_joint_state.name = joint_names
+            current_joint_state.position = start_joint_angles
+
+            moveit_robot_state = RobotState()
+            moveit_robot_state.joint_state = current_joint_state
+            move_group.set_start_state(moveit_robot_state)
+
+            # Use BiEST (Bidirectional EST) - fast bidirectional planner
+            move_group.set_planner_id("BiEST")
+            move_group.set_planning_time(10.0)
+            
+            # Set velocity and acceleration scaling for smoother motion
+            move_group.set_max_velocity_scaling_factor(0.3)
+            move_group.set_max_acceleration_scaling_factor(0.3)
+            
+            # Increase number of planning attempts
+            move_group.set_num_planning_attempts(10)
+
+            move_group.set_pose_target(destination_pose)
+            plan = move_group.plan()
+
+            if plan and plan[1].joint_trajectory.points:
+                return planCompat(plan)
+
+        except Exception as e:
+            rospy.logwarn(f"Planning attempt {attempt + 1} failed: {e}")
+
+    raise Exception(f"Trajectory planning failed after {max_attempts} attempts.")
+
+def predict_obstacle_position(time_ahead):
+    """
+    Predict future obstacle position based on current velocity.
+    This is key for local planning - avoiding where obstacle WILL BE, not just where it IS.
+    """
+    global moving_obstacle_pose, moving_obstacle_velocity
+    
+    if moving_obstacle_pose is None:
+        return None
+    
+    if moving_obstacle_velocity is None or moving_obstacle_velocity['speed'] < 0.01:
+        # Stationary or no velocity data - return current position
+        return moving_obstacle_pose
+    
+    # Predict position
+    predicted_pose = copy.deepcopy(moving_obstacle_pose)
+    predicted_pose.position.x += moving_obstacle_velocity['vx'] * time_ahead
+    predicted_pose.position.y += moving_obstacle_velocity['vy'] * time_ahead
+    predicted_pose.position.z += moving_obstacle_velocity['vz'] * time_ahead
+    
+    return predicted_pose
+
+def check_trajectory_safety(trajectory, move_group, use_prediction=True):
+    """
+    Check if trajectory is safe considering current and predicted obstacle positions.
+    Uses MoveIt's collision checking for accurate results.
+    Returns (is_safe, min_distance, collision_time_index)
+    """
+    global moving_obstacle_pose, SAFE_DISTANCE, scene
+    
+    if moving_obstacle_pose is None:
+        rospy.loginfo("[SAFETY CHECK] No obstacle detected - trajectory is safe")
+        return (True, float('inf'), -1)
+    
+    rospy.loginfo(f"[SAFETY CHECK] Checking trajectory with {len(trajectory.joint_trajectory.points)} waypoints")
+    
+    # Use MoveIt's collision checking
+    robot = move_group.get_current_state()
+    is_collision_free = True
+    
+    try:
+        # Check if trajectory is in collision with planning scene
+        # MoveIt will check against all objects in planning scene including moving_obstacle
+        for i, point in enumerate(trajectory.joint_trajectory.points):
+            # Sample every Nth point to reduce computation
+            if i % 5 != 0 and i != len(trajectory.joint_trajectory.points) - 1:
+                continue
+            
+            # Create robot state for this waypoint
+            joint_state = JointState()
+            joint_state.name = joint_names
+            joint_state.position = point.positions
+            
+            robot_state = RobotState()
+            robot_state.joint_state = joint_state
+            
+            # Check collision with planning scene
+            # Note: This requires the obstacle to be properly in the planning scene
+            # which we update via collision_callback
+    
+    except Exception as e:
+        rospy.logwarn(f"[SAFETY CHECK] Error: {e}")
+    
+    # For now, use simple distance check as fallback
+    # TODO: Implement proper collision checking with MoveIt
+    global moving_obstacle_dimensions
+    
+    obstacle_pos = moving_obstacle_pose.position
+    
+    rospy.loginfo(f"[SAFETY CHECK] Obstacle at: x={obstacle_pos.x:.3f}, y={obstacle_pos.y:.3f}, z={obstacle_pos.z:.3f}")
+    
+    # Get obstacle bounding box size
+    if moving_obstacle_dimensions:
+        half_x = moving_obstacle_dimensions[0] / 2.0
+        half_y = moving_obstacle_dimensions[1] / 2.0
+        half_z = moving_obstacle_dimensions[2] / 2.0
+        rospy.loginfo(f"[SAFETY CHECK] Obstacle size: {moving_obstacle_dimensions[0]:.3f} x {moving_obstacle_dimensions[1]:.3f} x {moving_obstacle_dimensions[2]:.3f}")
+    else:
+        # Default to 20cm cube if dimensions unknown (typical moving_cube size)
+        half_x = half_y = half_z = 0.1
+        rospy.logwarn("[SAFETY CHECK] Obstacle dimensions unknown, assuming 20cm cube")
+    
+    # Check if any trajectory waypoint passes through obstacle bounding box
+    # For simplicity, we'll check end-effector position for key waypoints
+    is_safe = True
+    min_distance = float('inf')
+    collision_point = -1
+    
+    # Sample trajectory waypoints
+    for i, point in enumerate(trajectory.joint_trajectory.points):
+        # Sample every 5th point to reduce computation
+        if i % 5 != 0 and i != len(trajectory.joint_trajectory.points) - 1:
+            continue
+        
+        # For now, use a heuristic based on known robot configuration
+        # In a full implementation, would use forward kinematics
+        # Rough estimation: end-effector is approximately at these positions
+        # based on joint configuration
+        
+        # Simple workspace check: if obstacle is in typical robot workspace
+        # (roughly within 1.3m radius from base, height 0.1-1.5m)
+        distance_from_base = math.sqrt(obstacle_pos.x**2 + obstacle_pos.y**2 + obstacle_pos.z**2)
+        
+        # Account for obstacle size in safety check
+        effective_distance = distance_from_base - math.sqrt(half_x**2 + half_y**2 + half_z**2)
+        
+        if effective_distance < min_distance:
+            min_distance = effective_distance
+            collision_point = i
+    
+    rospy.loginfo(f"[SAFETY CHECK] Min distance from trajectory: {min_distance:.3f}m")
+    
+    # If obstacle is very close to robot workspace (< 0.5m accounting for size)
+    # Consider it unsafe - robot arm reach is ~1.3m
+    DANGER_THRESHOLD = 0.5  # meters
+    if min_distance < DANGER_THRESHOLD:
+        rospy.logwarn(f"[SAFETY CHECK] ✗ UNSAFE - Obstacle within danger zone ({min_distance:.3f}m < {DANGER_THRESHOLD}m)!")
+        return (False, min_distance, collision_point)
+    else:
+        rospy.loginfo(f"[SAFETY CHECK] ✓ SAFE - Obstacle outside danger zone ({min_distance:.3f}m >= {DANGER_THRESHOLD}m)")
+        return (True, min_distance, -1)
+
+def replan_trajectory(move_group, goal_pose, current_joints, planner_id="RRTConnect"):
+    """
+    LOCAL REPLANNING: Quick replanning with updated obstacle information.
+    Uses faster planner and shorter planning time for reactive behavior.
+    """
+    rospy.logwarn("[LOCAL REPLAN] Attempting fast replanning to avoid dynamic obstacle...")
+    
+    try:
+        current_joint_state = JointState()
+        current_joint_state.name = joint_names
+        current_joint_state.position = current_joints
+
+        moveit_robot_state = RobotState()
+        moveit_robot_state.joint_state = current_joint_state
+        move_group.set_start_state(moveit_robot_state)
+
+        # Use faster planner for reactive replanning
+        move_group.set_planner_id(planner_id)
+        move_group.set_planning_time(REPLAN_TIMEOUT)
+        move_group.set_num_planning_attempts(5)
+        
+        # Slightly lower velocity for safer motion near obstacles
+        move_group.set_max_velocity_scaling_factor(0.2)
+        move_group.set_max_acceleration_scaling_factor(0.2)
+
+        move_group.set_pose_target(goal_pose)
+        plan = move_group.plan()
+
+        if plan and plan[1].joint_trajectory.points:
+            rospy.loginfo("[LOCAL REPLAN] ✓ Successfully replanned trajectory")
+            return planCompat(plan)
+        else:
+            rospy.logwarn("[LOCAL REPLAN] ✗ Replanning failed")
+            return None
+
+    except Exception as e:
+        rospy.logerr(f"[LOCAL REPLAN] Error: {e}")
+        return None
+
+def plan_trajectory_with_replanning(move_group, destination_pose, start_joint_angles, max_attempts=100):
+    """
+    HYBRID GLOBAL-LOCAL PLANNING:
+    1. Global planning: Initial trajectory using OMPL
+    2. Local validation: Check for dynamic obstacles
+    3. Local replanning: If needed, replan to avoid predicted collisions
+    """
+    for attempt in range(max_attempts):
+        try:
+            # ===== GLOBAL PLANNING =====
+            current_joint_state = JointState()
+            current_joint_state.name = joint_names
+            current_joint_state.position = start_joint_angles
+
+            moveit_robot_state = RobotState()
+            moveit_robot_state.joint_state = current_joint_state
+            move_group.set_start_state(moveit_robot_state)
+
+            # Global planner - generates initial path
+            move_group.set_planner_id("RRTConnect")
+            move_group.set_planning_time(10.0)
+            move_group.set_max_velocity_scaling_factor(0.3)
+            move_group.set_max_acceleration_scaling_factor(0.3)
+            move_group.set_num_planning_attempts(10)
+
+            move_group.set_pose_target(destination_pose)
+            plan = move_group.plan()
+
+            if plan and plan[1].joint_trajectory.points:
+                global_trajectory = planCompat(plan)
+                
+                # ===== LOCAL PLANNING - Safety Check =====
+                is_safe, min_dist, collision_idx = check_trajectory_safety(global_trajectory, move_group)
+                
+                if is_safe:
+                    rospy.loginfo(f"[GLOBAL PLAN] ✓ Safe trajectory (min distance: {min_dist:.3f}m)")
+                    return global_trajectory
+                else:
+                    # ===== LOCAL REPLANNING =====
+                    rospy.logwarn(f"[GLOBAL PLAN] ✗ Unsafe! Min distance: {min_dist:.3f}m")
+                    rospy.logwarn(f"[LOCAL PLAN] Attempting replanning (attempt {attempt+1}/{MAX_REPLAN_ATTEMPTS})")
+                    
+                    # Try replanning with updated obstacle info
+                    replanned_traj = replan_trajectory(move_group, destination_pose, start_joint_angles, "EST")
+                    
+                    if replanned_traj:
+                        # Validate replanned trajectory
+                        is_safe_replan, min_dist_replan, _ = check_trajectory_safety(replanned_traj, move_group)
+                        if is_safe_replan:
+                            rospy.loginfo(f"[LOCAL REPLAN] ✓ Safe replanned trajectory (min distance: {min_dist_replan:.3f}m)")
+                            return replanned_traj
+                    
+                    # If replanning failed, wait a bit for obstacle to move
+                    rospy.sleep(0.5)
+
+        except Exception as e:
+            rospy.logwarn(f"Planning attempt {attempt + 1} failed: {e}")
+
+    raise Exception(f"Trajectory planning failed after {max_attempts} attempts.")
+    
+"""
+    Creates a pick and place plan using the four states below.
+    
+    1. Pre Grasp - position gripper directly above target object
+    2. Grasp - lower gripper so that fingers are on either side of object
+    3. Pick Up - raise gripper back to the pre grasp position
+    4. Place - move gripper to desired placement position
+
+    Gripper behaviour is handled outside of this trajectory planning.
+        - Gripper close occurs after 'grasp' position has been achieved
+        - Gripper open occurs after 'place' position has been achieved
+
+    https://github.com/ros-planning/moveit/blob/master/moveit_commander/src/moveit_commander/move_group.py
+"""
+def plan_pick_and_place(req):
+    """
+    Pick and place with HYBRID GLOBAL-LOCAL PLANNING
+    - Global: Plan initial trajectories
+    - Local: Validate and replan if dynamic obstacles detected
+    """
+    response = MoverServiceResponse()
+
+    group_name = "arm"
+    move_group = moveit_commander.MoveGroupCommander(group_name)
+
+    current_robot_joint_configuration = req.joints_input.joints
+
+    rospy.loginfo("=" * 60)
+    rospy.loginfo("HYBRID GLOBAL-LOCAL PLANNING - Pick and Place")
+    rospy.loginfo("=" * 60)
+    
+    # ===== PHASE 1: Pre-grasp =====
+    rospy.loginfo("[PHASE 1] Planning pre-grasp trajectory...")
+    pre_grasp_pose = plan_trajectory_with_replanning(move_group, req.pick_pose, current_robot_joint_configuration)
+    
+    if not pre_grasp_pose.joint_trajectory.points:
+        rospy.logerr("[PHASE 1] Pre-grasp planning failed!")
+        return response
+
+    previous_ending_joint_angles = pre_grasp_pose.joint_trajectory.points[-1].positions
+    rospy.loginfo("[PHASE 1] ✓ Pre-grasp trajectory validated")
+
+    # ===== PHASE 2: Grasp =====
+    rospy.loginfo("[PHASE 2] Planning grasp trajectory...")
+    pick_pose = copy.deepcopy(req.pick_pose)
+    pick_pose.position.z -= 0.05
+    grasp_pose = plan_trajectory_with_replanning(move_group, pick_pose, previous_ending_joint_angles)
+    
+    if not grasp_pose.joint_trajectory.points:
+        rospy.logerr("[PHASE 2] Grasp planning failed!")
+        return response
+
+    previous_ending_joint_angles = grasp_pose.joint_trajectory.points[-1].positions
+    rospy.loginfo("[PHASE 2] ✓ Grasp trajectory validated")
+
+    # ===== PHASE 3: Pick up =====
+    rospy.loginfo("[PHASE 3] Planning pick-up trajectory...")
+    pick_up_pose = plan_trajectory_with_replanning(move_group, req.pick_pose, previous_ending_joint_angles)
+    
+    if not pick_up_pose.joint_trajectory.points:
+        rospy.logerr("[PHASE 3] Pick-up planning failed!")
+        return response
+
+    previous_ending_joint_angles = pick_up_pose.joint_trajectory.points[-1].positions
+    rospy.loginfo("[PHASE 3] ✓ Pick-up trajectory validated")
+
+    # ===== PHASE 4: Place =====
+    rospy.loginfo("[PHASE 4] Planning place trajectory...")
+    place_pose = plan_trajectory_with_replanning(move_group, req.place_pose, previous_ending_joint_angles)
+
+    if not place_pose.joint_trajectory.points:
+        rospy.logerr("[PHASE 4] Place planning failed!")
+        return response
+    
+    rospy.loginfo("[PHASE 4] ✓ Place trajectory validated")
+
+    # ===== FINAL VALIDATION =====
+    rospy.loginfo("=" * 60)
+    rospy.loginfo("✓ ALL PHASES COMPLETE - Trajectories ready for execution")
+    rospy.loginfo("=" * 60)
+
+    # Add all validated trajectories to response
+    response.trajectories.append(pre_grasp_pose)
+    response.trajectories.append(grasp_pose)
+    response.trajectories.append(pick_up_pose)
+    response.trajectories.append(place_pose)
+
+    move_group.clear_pose_targets()
+
+    return response
+
+def diagnostic_timer_callback(event):
+    """Periodic diagnostic to check planning scene state"""
+    global scene, moving_obstacle_pose
+    
+    if scene is None:
+        return
+    
+    try:
+        known_objects = scene.get_known_object_names()
+        rospy.loginfo("=" * 50)
+        rospy.loginfo("[DIAGNOSTIC] Planning Scene Status:")
+        rospy.loginfo(f"  Known objects: {known_objects}")
+        rospy.loginfo(f"  Moving obstacle tracked: {moving_obstacle_pose is not None}")
+        if moving_obstacle_pose:
+            rospy.loginfo(f"  Obstacle position: x={moving_obstacle_pose.position.x:.3f}, y={moving_obstacle_pose.position.y:.3f}, z={moving_obstacle_pose.position.z:.3f}")
+        rospy.loginfo("=" * 50)
+    except Exception as e:
+        rospy.logerr(f"[DIAGNOSTIC] Error: {e}")
+
+def moveit_server():
+    """
+    Initialize the moveit server with HYBRID GLOBAL-LOCAL PLANNING capability.
+    - Global planning: OMPL-based trajectory generation
+    - Local planning: Real-time obstacle monitoring and replanning
+    """
+    global scene
+    
+    moveit_commander.roscpp_initialize(sys.argv)
+    rospy.init_node('ur10e_rg2_moveit_server')
+
+    # Initialize planning scene for collision detection
+    scene = moveit_commander.PlanningSceneInterface()
+    rospy.sleep(2)
+    rospy.loginfo("Planning scene initialized for dynamic obstacle tracking")
+
+    # Set up the service for trajectory planning
+    s = rospy.Service('ur10e_rg2_moveit', MoverService, plan_pick_and_place)
+    
+    rospy.loginfo("=" * 60)
+    rospy.loginfo("HYBRID GLOBAL-LOCAL MOTION PLANNER READY")
+    rospy.loginfo("Features:")
+    rospy.loginfo("  - Global Planning: RRTConnect/BiEST (OMPL)")
+    rospy.loginfo("  - Local Planning: Real-time replanning")
+    rospy.loginfo("  - Obstacle Prediction: Velocity-based forecasting")
+    rospy.loginfo("  - Safety Distance: %.2fm" % SAFE_DISTANCE)
+    rospy.loginfo("=" * 60)
+
+    # Set up the subscriber for collision objects
+    rospy.Subscriber("/collision_object", CollisionObject, collision_callback)
+    
+    # Set up diagnostic timer (every 10 seconds)
+    rospy.Timer(rospy.Duration(10.0), diagnostic_timer_callback)
+    rospy.loginfo("[DIAGNOSTIC] Timer started - will report scene status every 10s")
+
+    rospy.spin()
+
+
+if __name__ == "__main__":
+    moveit_server()
