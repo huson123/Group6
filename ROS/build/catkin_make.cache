@@ -1,0 +1,2 @@
+moveit_msgs:ros_tcp_endpoint:ur10e_rg2_moveit:ur10e_rg2_urdf
+-DCATKIN_DEVEL_PREFIX=/home/vijt/ur10e_ros_noetic_unity/ROS/devel -DCMAKE_INSTALL_PREFIX=/home/vijt/ur10e_ros_noetic_unity/ROS/install -G Unix Makefiles
